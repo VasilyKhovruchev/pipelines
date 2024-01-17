@@ -1,0 +1,312 @@
+# working version of pipeline develop
+variables:
+  VERSION: 2.8.${CI_PIPELINE_ID}
+
+stages:
+  - start
+  - build
+  - upload
+  - test
+  - release
+  - notify
+
+include:
+#  - project: 'templates/ci'
+#    file: 'DockerInDockerTemplate.yml'
+  - template: 'Security/Container-Scanning.gitlab-ci.yml'
+#  - template: 'SAST.gitlab-ci.yml'
+
+switch_on_worker_node:
+  variables:
+    GIT_STRATEGY: none
+  stage: start
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  script:
+    - echo ${VERSION}
+# develop, check if working node is alive
+    - |-
+        if [[ $CI_COMMIT_BRANCH == "develop" ]]; then
+          export HOST=${RELEASEHOST1}
+          echo ${HOST}
+          ping -c1 ${HOST} 1>/dev/null || PINGRESULT=$?
+          if [[ ${PINGRESULT} -ne 0 ]]; then
+            exit 1
+          fi
+          exit 0
+        fi
+# release and devtest
+    - source "/home/gitlab-runner/.bashrc"
+    - ping -c1 ${BUILD_HOST} 1>/dev/null 2>/dev/null || PINGRESULT=$?
+    - echo ${PINGRESULT}
+    - |-
+        if [[ ${PINGRESULT} -ne 0 ]]; then
+          echo "Now starting up node in Yandex Cloud"
+          yc compute instance start sborka-analyzer
+          sleep 60
+        else
+          while ping -q -c 1 ${BUILD_HOST} >/dev/null ; do sleep 1; done ;
+          echo "Server stopped responding"
+          sleep 30
+          echo "Now starting up node in Yandex Cloud"
+          yc compute instance start ${BUILD_HOST_NAME}
+          sleep 60
+        fi
+
+################################# build images
+
+build-images:
+  stage: build
+  variables:
+    GIT_STRATEGY: fetch
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  needs:
+    - switch_on_worker_node
+  script:
+#develop, quick build of complex
+    - |-
+        if [[ $CI_COMMIT_BRANCH == "develop" ]]; then
+          export HOST=${RELEASEHOST1}
+          ssh ${HOST} "ls"
+          ssh ${HOST} -o SendEnv "CI_COMMIT_BRANCH=${CI_COMMIT_BRANCH}" "export CI_COMMIT_BRANCH=$CI_COMMIT_BRANCH && cd analyzer && git checkout $CI_COMMIT_BRANCH ||true && git pull && ./build/qs/build.sh common && ./build/qs/build.sh backend && ./build/qs/dev.sh"
+          exit 0
+        fi
+    - ssh ${BUILD_HOST} -o SendEnv "CI_COMMIT_BRANCH=${CI_COMMIT_BRANCH}" "export CI_COMMIT_BRANCH=$CI_COMMIT_BRANCH && cd analyzer && git checkout $CI_COMMIT_BRANCH && git pull"
+    - ssh ${BUILD_HOST} "cd analyzer/build/qs && ./pack.sh -d"
+# upload to registry    
+    - ssh ${BUILD_HOST} -o SendEnv "CI_REGISTRY_USER=${CI_REGISTRY_USER} CI_REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD} CI_REGISTRY=${CI_REGISTRY} CI_COMMIT_BRANCH=${CI_COMMIT_BRANCH}" "/bin/bash" -c "export CI_REGISTRY_USER=${CI_REGISTRY_USER} && export CI_REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD} && export CI_REGISTRY=${CI_REGISTRY} && docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY || true"
+    - ssh ${BUILD_HOST} -o SendEnv "CI_REGISTRY_USER=${CI_REGISTRY_USER} CI_REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD} CI_REGISTRY=${CI_REGISTRY} CI_COMMIT_BRANCH=${CI_COMMIT_BRANCH} CI_COMMIT_SHA=${CI_COMMIT_SHA}" "/bin/bash" < build/script/tagandpush.sh
+
+#################################
+
+upload-images:
+  stage: upload
+  needs:
+    - build-images
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  variables:
+    GIT_STRATEGY: fetch
+  script:
+    - |-
+        if [[ $CI_COMMIT_BRANCH == "develop" ]]; then
+          exit 0
+        fi
+    - ls
+    - VERSION="$(grep -o -m 1 '\[[0-9]\+\.[0-9]\+\.[0-9]\+\]' ./CHANGELOG)"
+    - VERSION="v${VERSION:1:-1}"
+    - echo VERSION=${VERSION} >> build.env
+    - echo "Upload ready package to store"
+    - FOLDER="${CI_COMMIT_BRANCH}-"${VERSION}"-"$(date +%F-%H-%M)
+    - ssh ${BUILD_HOST} "mkdir ~/mount/${FOLDER} && cp -r ~/analyzer/build/qs/analyzer-package/* ~/mount/${FOLDER}"
+    - echo FOLDER=${FOLDER} >> build.env
+  artifacts:
+    paths:
+      - build.env
+
+############################
+# container scanning
+
+container_scanning:
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "devtest"'
+#  - if: '$CI_COMMIT_BRANCH == "develop"'
+    when: on_success
+  - when: never
+  variables:
+    DOCKER_IMAGE: $CI_REGISTRY/smis-software/analyzer/develop/analyzer-backend:latest
+    GIT_STRATEGY: "fetch"
+    DOCKER_USER: $CI_REGISTRY_USER
+    DOCKER_PASSWORD: $CI_REGISTRY_PASSWORD
+  artifacts:
+    paths:
+    - gl-dependency-scanning-report.json
+    - gl-container-scanning-report.json
+    expire_in: 1 day
+
+
+container_scanning_image2:
+  extends: container_scanning
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "devtest"'
+#  - if: '$CI_COMMIT_BRANCH == "develop"'
+    when: on_success
+  - when: never
+  variables:
+    DOCKER_IMAGE: $CI_REGISTRY/smis-software/analyzer/develop/analyzer-frontendmain:latest
+    DOCKER_USER: $CI_REGISTRY_USER
+    DOCKER_PASSWORD: $CI_REGISTRY_PASSWORD
+  artifacts:
+    paths:
+    - gl-dependency-scanning-report.json
+    - gl-container-scanning-report.json
+    expire_in: 1 day
+
+
+############################
+# release to host $RELEASEHOST*
+
+validate-job:
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  stage: release
+  script:
+    - echo ${VERSION}
+
+release_analyzer:
+  stage: release
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  needs:
+    - build-images
+    - validate-job
+    - upload-images
+  variables:
+    GIT_STRATEGY: none
+  environment:
+    name: release_analyzer/$CI_COMMIT_REF_SLUG
+    url: https://${RELEASEHOST}:1443
+    on_stop: delete_deploy
+  script:
+    - echo ${VERSION}
+    - echo ${CI_COMMIT_BRANCH}
+    - |-
+        if [[ $CI_COMMIT_BRANCH == "release" ]]; then
+          export RELEASEHOST=${RELEASEHOST3}
+        elif [[ $CI_COMMIT_BRANCH == "devtest" ]]; then
+          export RELEASEHOST=${RELEASEHOST2}
+        fi
+    - echo "RELEASEHOST=${RELEASEHOST}" >> build.env
+    - echo ${RELEASEHOST}
+    - ping -c1 ${RELEASEHOST} 1>/dev/null 2>/dev/null || PINGRESULT=$?
+    - |-
+        if [[ ${PINGRESULT} -ne 0 ]]; then
+          echo "release failed"
+          exit 1
+        fi
+    - |-
+        if [[ $CI_COMMIT_BRANCH == "release" ]]; then
+          ssh ${RELEASEHOST} "rm -r ~/analyzer-package || true && mkdir analyzer-package"
+          ssh ${BUILD_HOST} -o SendEnv "RELEASEHOST=${RELEASEHOST}"  "scp -r ~/analyzer/build/qs/analyzer-package-arshan/* ${RELEASEHOST}:~/analyzer-package"
+          ssh ${RELEASEHOST} "~/analyzer-package/start.sh stop || true"
+          ssh ${BUILD_HOST} -o SendEnv "RELEASEHOST=${RELEASEHOST}" "echo ${RELEASEHOST}"
+          ssh ${RELEASEHOST} "~/analyzer-package/start.sh update || RESULT=$? && echo $RESULT"
+        elif [[ $CI_COMMIT_BRANCH == "devtest" ]]; then
+          ssh ${RELEASEHOST} "rm -r ~/analyzer-package || true && mkdir analyzer-package"
+          ssh ${BUILD_HOST} -o SendEnv "RELEASEHOST=${RELEASEHOST}"  "scp -r ~/analyzer/build/qs/analyzer-package/* ${RELEASEHOST}:~/analyzer-package"
+          ssh ${RELEASEHOST} "~/analyzer-package/start.sh stop || true"
+          ssh ${RELEASEHOST} "~/analyzer-package/start.sh update || RESULT=$? && echo $RESULT"
+        fi
+  artifacts:
+    paths:
+      - build.env
+
+delete_deploy:
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  before_script:
+    - ls
+  stage: release
+  script:
+
+    - |-
+        if [[ $CI_COMMIT_BRANCH == "release" ]]; then
+          export RELEASEHOST=${RELEASEHOST3}
+        elif [[ $CI_COMMIT_BRANCH == "devtest" ]]; then
+          export RELEASEHOST=${RELEASEHOST2}
+        fi
+
+    - ssh ${RELEASEHOST} "/bin/bash -s " < ./build/script/deldeploy.sh
+
+  when: manual
+  environment:
+    name: release_analyzer/$CI_COMMIT_REF_SLUG
+    action: stop
+
+
+switch_off_worker_node:
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  stage: .post
+  script:
+    - source "/home/gitlab-runner/.bashrc"
+    - echo "Switcing off node in Yandex Cloud"
+    - yc compute instance stop sborka-analyzer
+
+send_to_telegram:
+  variables:
+    GIT_STRATEGY: none
+  stage: notify
+  rules:
+  - changes:
+      - ".gitlab-ci.yml"
+      - "README.md"
+    when: never
+  - if: '$CI_COMMIT_BRANCH == "release" || $CI_COMMIT_BRANCH == "devtest"'
+    when: on_success
+  - when: never
+  needs:
+   - release_analyzer
+  script:
+    - |-
+        if [[ $CI_COMMIT_BRANCH == "release" ]]; then
+          export RELEASEHOST=${RELEASEHOST3}
+        elif [[ $CI_COMMIT_BRANCH == "devtest" ]]; then
+          export RELEASEHOST=${RELEASEHOST2}
+        fi
+    - source build.env
+    - cat build.env
+    - chmod +x build/script/send.sh
+    - echo ${VERSION}  ${FOLDER}  ${RELEASEHOST}
+    - build/script/send.sh "Релиз ${VERSION}-${CI_PIPELINE_ID} собран и развернут на ${RELEASEHOST}:1443. [Скачать] \\\\192.168.105.2\Releases\\${FOLDER}"

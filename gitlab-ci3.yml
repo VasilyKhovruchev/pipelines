@@ -1,0 +1,125 @@
+variables:
+   VERSION: 28.43.${CI_PIPELINE_ID}
+
+include:
+  - project: 'templates/ci'
+    file: 'DockerInDockerTemplate.yml'
+
+###########################################
+
+stages:
+  - build
+  - validate
+  - terraform
+  - deploy
+
+# build
+
+build-backend:
+  stage: build
+  only:
+    changes:
+      - backend/**/*
+  trigger:
+    include:
+      - "/backend/.gitlab-ci.yml"
+    strategy: depend
+
+build-frontend:
+  stage: build
+  only:
+    changes:
+      - frontend/**/*
+  trigger:
+    include:
+      - "/frontend/.gitlab-ci.yml"
+    strategy: depend
+
+validate-job:
+  stage: validate
+  trigger:
+    include:
+      - "yamls/validate.yml"
+
+############## terraform
+
+terraform:
+  stage: terraform
+  image: vault:1.13.3
+  when: on_success
+  needs:
+    - validate-job
+  before_script:
+    - apk update && apk add curl bash
+    - curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash && PATH=$HOME/yandex-cloud/bin:$PATH
+    - apk add helm
+    - curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+    - chmod +x ./kubectl
+    - mv ./kubectl /usr/bin/kubectl
+    - curl -LO https://storage.yandexcloud.net/soft-temp/terraform_1.6.6_linux_amd64.zip
+    - unzip -d /usr/bin terraform_1.6.6_linux_amd64.zip
+    - chmod +x /usr/bin/terraform
+    - rm terraform_1.6.6_linux_amd64.zip
+    - export VAULT_ADDR=${VAULT_ADDR}
+    - export VAULT_TOKEN="$(vault write -field=token auth/jwt/login role=dumplings jwt=$CI_JOB_JWT)"
+    - export CLOUD_ID="$(vault kv get -field=cloud_id data/cluster)"
+    - export FOLDER_ID="$(vault kv get -field=folder_id data/cluster)"
+    - export KEYFILE5="$(vault kv get -field=keyfile5 data/cluster)"
+    - export PUBKEY="$(vault kv get -field=pub data/cluster)"
+    - export ACCESS_KEY="$(vault kv get -field=access_key data/cluster)"
+    - export SECRET_KEY="$(vault kv get -field=secret_key data/cluster)"
+    - export S3_ACCESS_KEY="$(vault kv get -field=storage_access_key data/cluster)"
+    - export S3_SECRET_KEY="$(vault kv get -field=storage_secret_key data/cluster)"
+    - export NEXUS_USER="$(vault kv get -field=nexus_user data/cluster)"
+    - export NEXUS_PASSWORD="$(vault kv get -field=nexus_pass data/cluster)"
+    - echo $PUBKEY > terraform/pub
+    - echo $KEYFILE5 > terraform/keyfile
+    - yc config profile create terraform
+    - yc config set service-account-key terraform/keyfile
+    - yc config set cloud-id ${CLOUD_ID}
+    - yc config set folder-id ${FOLDER_ID}
+    - cd terraform
+    - cp prov_inst ~/.terraformrc
+    - mkdir ~/.kube
+    - terraform init -backend-config="access_key=${S3_ACCESS_KEY}" -backend-config="secret_key=${S3_SECRET_KEY}"
+  script:
+    - yc compute instance list
+    - terraform apply -refresh=false -auto-approve || true
+    - terraform output | sed '/EOT/d' > ~/.kube/config && chmod 600 ~/.kube/config
+    - helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    - helm repo update
+    - helm install ingress-nginx ingress-nginx/ingress-nginx -n default --set controller.service.loadBalancerIP=${EXT_ADDRESS} || true
+    - kubectl apply -f ../yamls/cluster-issuer.yaml
+    - kubectl apply -f ../yamls/grafana-ingress.yaml
+
+############### Deploy
+
+deploy:
+  stage: deploy
+  image: vault:1.13.3
+  needs:
+    - terraform
+  dependencies:
+    - terraform
+  script:
+    - terraform output | sed '/EOT/d' > ~/.kube/config && chmod 600 ~/.kube/config
+    - helm repo add store https://${NEXUS_USER}:${NEXUS_PASSWORD}@${NEXUS_URL}repository/${NEXUS_REPO}/
+    - helm repo update
+    - helm install store store/store -n default
+  environment:
+    name: deploy/${CI_COMMIT_REF_NAME}
+    url: ${STAGING_URL}
+    on_stop: delete_deploy
+
+################# Delete deploy
+
+delete_deploy:
+  stage: deploy
+  image: vault:1.13.3
+  script:
+    - terraform state pull
+    - terraform destroy -auto-approve || true
+  when: manual
+  environment:
+    name: deploy/${CI_COMMIT_REF_NAME}
+    action: stop

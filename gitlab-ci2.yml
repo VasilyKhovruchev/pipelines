@@ -1,0 +1,199 @@
+# backend 
+########
+
+variables:
+   VERSION: 2.11.${CI_PIPELINE_ID}
+   SAST_EXCLUDED_ANALYZERS: "eslint,nodejs-scan"
+
+cache:
+  paths:
+    - backend/deldeploy.sh
+
+include:
+  - project: 'templates/ci'
+    file: 'DockerInDockerTemplate.yml'
+  - template: 'Container-Scanning.gitlab-ci.yml'
+  - template: 'SAST.gitlab-ci.yml'
+
+stages:
+  - build
+  - test
+  - release
+  - deploy
+  - testbackendresponse
+  - notify
+
+################################# build image
+
+build-backend:
+  stage: build
+  image: docker:20.10.12-dind-rootless
+  before_script:
+    - until docker info; do sleep 1; done
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - cd backend
+    - docker login -u ${MYDOCKER_USER} -p ${MYDOCKER_TOKEN}
+    - >
+      docker build
+      --build-arg VERSION=$VERSION
+      --tag $CI_REGISTRY_IMAGE/project1-backend:$CI_COMMIT_SHA
+      .
+- docker push $CI_REGISTRY_IMAGE/project1-backend:$CI_COMMIT_SHA
+
+#################################
+
+#  scanning Job
+
+container_scanning:
+  stage: test
+  needs:
+    - build-backend
+  allow_failure: true
+  variables:
+    CS_REGISTRY_USER: "$CI_REGISTRY_USER"
+    CS_REGISTRY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+    CS_IMAGE: "$CI_REGISTRY_IMAGE/project1-backend:$CI_COMMIT_SHA"
+    GIT_STRATEGY: fetch
+    SECURE_LOG_LEVEL: "debug"
+  before_script:
+    - export SPRING_CLOUD_VAULT_ENABLED="false"
+    - echo $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - export DOCKER_IMAGE="$CI_REGISTRY_IMAGE/$CI_COMMIT_BRANCH:$CI_COMMIT_SHA"
+sast:
+  stage: test
+  needs:
+    - build-backend
+  allow_failure: true
+  artifacts:
+    paths:
+    - gl-sast-report.json
+    - gl-secret-detection-report.json
+    - gl-dependency-scanning-report.json
+    - gl-container-scanning-report.json
+    expire_in: 1 day
+
+
+##################################
+
+validate-job:
+  stage: release
+  script:
+    - echo ${VERSION}
+
+
+##################################  tag as latest
+
+upload-backend-latest:
+  variables:
+    GIT_STRATEGY: none
+  image: docker:20.10.12-dind-rootless
+  stage: release
+  needs:
+    - validate-job
+    - build-backend
+  before_script:
+    - until docker info; do sleep 1; done
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker pull $CI_REGISTRY_IMAGE/project1-backend:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE/project1-backend:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/project1-backend:latest
+    - docker push $CI_REGISTRY_IMAGE/project1-backend:latest
+
+##################################### Deploy to a target host
+
+deploy-backend:
+  stage: deploy
+  image: vault:1.11.3
+  needs:
+    - upload-backend-latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+    - if: '$CI_COMMIT_BRANCH == "microservices"'
+      when: manual
+  before_script:
+    - apk add openssh-client bash docker docker-compose
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - export VAULT_ADDR=${VAULT_ADDR}
+    - export VAULT_TOKEN="$(vault write -field=token auth/jwt/login role=project1-store jwt=$CI_JOB_JWT)"
+    - export POSTGRESQL_USER="$(vault kv get -field=spring.datasource.username secret/project1-store)"
+    - export POSTGRESQL_PASS="$(vault kv get -field=spring.datasource.password secret/project1-store)"
+    - export SPRING_DATA_MONGODB_URI="$(vault kv get -field=spring.datasource.mongodb.uri secret/project1-store)"
+
+    - export CI_REGISTRY_USER=${CI_REGISTRY_USER}
+    - export CI_REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD}
+    - export CI_REGISTRY_IMAGE=${CI_REGISTRY_IMAGE}
+    - export CI_REGISTRY=${CI_REGISTRY}
+ 
+    - docker context create remote --docker "host=ssh://${DEV_USER}@${DEV_HOST}"
+    - docker context use remote && docker context use default
+
+    - ssh ${DEV_USER}@${DEV_HOST} 
+       export "CI_REGISTRY_USER=${CI_REGISTRY_USER}";
+       export "CI_REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD}";
+       export "CI_REGISTRY=${CI_REGISTRY}";
+       export "CI_REGISTRY_IMAGE=${CI_REGISTRY_IMAGE}";
+        "/bin/bash" -c "docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY && docker pull $CI_REGISTRY_IMAGE/project1-backend:latest || true"
+
+    - docker-compose --context remote up -d backend
+
+testbackendresponse:
+  before_script:
+    - 'command -v ssh-agent >/dev/null || ( apt update && apt install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "${SSH_PRIVATE_KEY}" | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 600 ~/.ssh
+    - echo "${SSH_KNOWN_HOSTS}" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  stage: testbackendresponse
+  needs:
+    - deploy-backend
+  variables:
+    GIT_STRATEGY: non
+  script:
+    - cat backend/check_backend.sh
+    - ssh ${DEV_USER}@${DEV_HOST}
+      "/bin/bash -s" < ./backend/check_backend.sh
+
+
+delete_deploy:
+  before_script:
+    - 'command -v ssh-agent >/dev/null || ( apt update && apt install openssh-client -y )'
+    - eval $(ssh-agent -s)
+    - echo "${SSH_PRIVATE_KEY}" | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 600 ~/.ssh
+    - echo "${SSH_KNOWN_HOSTS}" >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    - ls
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - ssh ${DEV_USER}@${DEV_HOST} "export "VERSION=${VERSION}"; setsid /bin/bash -s" < ./backend/deldeploy.sh
+  when: manual
+  environment:
+    name: deploy-backend/${CI_COMMIT_REF_NAME}
+    action: stop
+
+######## manual notifications
+
+telegram-notification-backend:
+  stage: notify
+  when: manual
+  needs:
+    - build-backend
+    - upload-backend-latest
+  only:
+    changes:
+      - backend/**/*
+  script:
+    - script/send.sh "Контейнер с бэкендом ${VERSION} собран."
