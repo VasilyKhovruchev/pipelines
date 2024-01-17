@@ -94,6 +94,8 @@ terraform:
 
 ############### Deploy
 
+include: 'templates/terraformprep.yml'
+
 deploy:
   stage: deploy
   image: vault:1.13.3
